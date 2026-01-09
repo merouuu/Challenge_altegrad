@@ -27,7 +27,14 @@ TRAIN_GRAPHS = f"{base_path}/train_graphs.pkl"
 VAL_GRAPHS   = f"{base_path}/validation_graphs.pkl"
 TRAIN_EMB_CSV = f"{base_path}/train_embeddings.csv"
 VAL_EMB_CSV   = f"{base_path}/validation_embeddings.csv"
-MODEL_SAVE_PATH = f"{base_path}/GT/transformer_model.pt"
+
+# --- FIX: Create the directory first ---
+OUTPUT_DIR = f"{base_path}/GT"
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"Created directory: {OUTPUT_DIR}")
+
+MODEL_SAVE_PATH = f"{OUTPUT_DIR}/transformer_model.pt"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
