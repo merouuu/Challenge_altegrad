@@ -1,5 +1,11 @@
 import os
 import pickle
+import argparse
+
+parser = argparse.ArgumentParser(description="Script d'entraînement")
+parser.add_argument('--env', type=str, default='local', choices=['local', 'colab'], 
+                    help="Définir l'environnement : 'local' ou 'colab'")
+args = parser.parse_args()
 
 
 def inspect_graph_file(pkl_path, num_samples=3):
@@ -74,8 +80,7 @@ def inspect_graph_file(pkl_path, num_samples=3):
 
 
 def main():
-    #base_path = "data"
-    base_path = "/content/drive/MyDrive/data"
+    base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
     splits = ["train", "validation", "test"]
     
     print("=" * 100)

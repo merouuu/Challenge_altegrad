@@ -6,9 +6,14 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
+import argparse
 
-base_path = "/content/drive/MyDrive/data"
-base_path = '/data'
+parser = argparse.ArgumentParser(description="Script d'entraînement")
+parser.add_argument('--env', type=str, default='local', choices=['local', 'colab'], 
+                    help="Définir l'environnement : 'local' ou 'colab'")
+args = parser.parse_args()
+
+base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
 
 # Configuration
 MAX_TOKEN_LENGTH = 128

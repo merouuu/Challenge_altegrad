@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import pandas as pd
@@ -12,6 +13,13 @@ from data_utils import (
 from train_gcn import (
     MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
 )
+
+parser = argparse.ArgumentParser(description="Script d'entraînement")
+parser.add_argument('--env', type=str, default='local', choices=['local', 'colab'], 
+                    help="Définir l'environnement : 'local' ou 'colab'")
+args = parser.parse_args()
+
+base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
 
 
 @torch.no_grad()

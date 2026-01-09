@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import torch
@@ -13,12 +14,15 @@ from data_utils import (
     PreprocessedGraphDataset, collate_fn
 )
 
+parser = argparse.ArgumentParser(description="Script d'entraînement")
+parser.add_argument('--env', type=str, default='local', choices=['local', 'colab'], 
+                    help="Définir l'environnement : 'local' ou 'colab'")
+args = parser.parse_args()
 
 # =========================================================
 # CONFIG
 # =========================================================
-#base_path='/data'
-base_path = "/content/drive/MyDrive/data"
+base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
 TRAIN_GRAPHS = f"{base_path}/train_graphs.pkl"
 VAL_GRAPHS   = f"{base_path}/validation_graphs.pkl"
 TEST_GRAPHS  = f"{base_path}/test_graphs.pkl"
@@ -157,7 +161,7 @@ def main():
             val_scores = {}
         print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
     
-    model_path = "model_checkpoint.pt"
+    model_path = f"{base_path}/model_checkpoint.pt"
     torch.save(mol_enc.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 
