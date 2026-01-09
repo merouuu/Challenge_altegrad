@@ -121,7 +121,7 @@ def main():
     
     # Configuration Baseline
     model = MolGraphTransformer(hidden=128, out_dim=emb_dim, layers=4, heads=4).to(DEVICE)
-    model_path = f"{base_path}/GT/model_checkpoint.pt"
+    model_path = f"{base_path}/GT/transformer_model.pt"
     output_csv = f"{base_path}/submission_GT.csv"
     
     # Chargement des poids
