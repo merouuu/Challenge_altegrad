@@ -1,5 +1,6 @@
 import argparse
 import os
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +40,7 @@ if not os.path.exists(OUTPUT_DIR):
     print(f"Created directory: {OUTPUT_DIR}")
 
 MODEL_SAVE_PATH = f"{OUTPUT_DIR}/contrastive_model.pt"
+LOGS_SAVE_PATH = f"{OUTPUT_DIR}/training_logs.json"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -297,22 +299,47 @@ def train_epoch(model, loader, optimizer, device, temp):
 
 
 @torch.no_grad()
-def eval_retrieval(data_path, emb_dict, model, device):
+def eval_retrieval(data_path, emb_dict, model, device, temp=0.1, compute_loss=True):
+    """
+    Évalue le modèle sur le validation set.
+    
+    Args:
+        data_path: Chemin vers les graphes de validation
+        emb_dict: Dictionnaire des embeddings de texte
+        model: Modèle à évaluer
+        device: Device (cuda/cpu)
+        temp: Température pour la loss contrastive (si compute_loss=True)
+        compute_loss: Si True, calcule aussi la validation loss
+    
+    Returns:
+        Dictionnaire avec les métriques de retrieval et optionnellement la loss
+    """
     model.eval()
     ds = PreprocessedGraphDataset(data_path, emb_dict)
     dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
 
     all_mol, all_txt = [], []
+    total_val_loss, total_count = 0.0, 0
+    
     for graphs, text_emb in dl:
         graphs = graphs.to(device)
         text_emb = text_emb.to(device)
         
-        all_mol.append(model(graphs))
+        mol_vec = model(graphs)
+        
+        # Calcul de la validation loss si demandé
+        if compute_loss:
+            val_loss = contrastive_loss(mol_vec, text_emb, temperature=temp)
+            total_val_loss += val_loss.item() * graphs.num_graphs
+            total_count += graphs.num_graphs
+        
+        all_mol.append(mol_vec)
         all_txt.append(F.normalize(text_emb, dim=-1))
         
     all_mol = torch.cat(all_mol, dim=0)
     all_txt = torch.cat(all_txt, dim=0)
 
+    # Métriques de retrieval
     sims = all_txt @ all_mol.t()
     
     ranks = sims.argsort(dim=-1, descending=True)
@@ -326,7 +353,13 @@ def eval_retrieval(data_path, emb_dict, model, device):
     r5 = (pos <= 5).float().mean().item()
     r10 = (pos <= 10).float().mean().item()
 
-    return {"MRR": mrr, "R@1": r1, "R@5": r5, "R@10": r10}
+    results = {"MRR": mrr, "R@1": r1, "R@5": r5, "R@10": r10}
+    
+    # Ajouter la validation loss si calculée
+    if compute_loss:
+        results["val_loss"] = total_val_loss / total_count if total_count > 0 else 0.0
+
+    return results
 
 
 # =========================================================
@@ -380,13 +413,30 @@ def main():
     )
 
     best_mrr = 0.0
+    training_logs = {
+        "config": {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "temp": args.temp,
+            "hidden": args.hidden,
+            "layers": args.layers,
+            "heads": args.heads
+        },
+        "epochs": []
+    }
+    
     for ep in range(args.epochs):
         train_loss = train_epoch(model, train_dl, optimizer, DEVICE, args.temp)
+        
+        # Récupérer le learning rate actuel
+        current_lr = optimizer.param_groups[0]['lr']
         
         val_metrics = {}
         if os.path.exists(VAL_GRAPHS) and os.path.exists(VAL_EMB_CSV):
             val_emb = load_id2emb(VAL_EMB_CSV)
-            val_metrics = eval_retrieval(VAL_GRAPHS, val_emb, model, DEVICE)
+            # Calculer les métriques de retrieval ET la validation loss
+            val_metrics = eval_retrieval(VAL_GRAPHS, val_emb, model, DEVICE, temp=args.temp, compute_loss=True)
             
             # Scheduler step basé sur MRR
             scheduler.step(val_metrics["MRR"])
@@ -396,9 +446,33 @@ def main():
                 torch.save(model.state_dict(), MODEL_SAVE_PATH)
                 print(f"  [New Best Model Saved] MRR: {best_mrr:.4f}")
 
-        print(f"Epoch {ep+1:02d}/{args.epochs} | Loss: {train_loss:.4f} | Val: {val_metrics}")
+        # Enregistrer les logs
+        epoch_log = {
+            "epoch": ep + 1,
+            "train_loss": float(train_loss),
+            "learning_rate": float(current_lr),
+            "val_loss": float(val_metrics.get("val_loss", 0.0)),
+            "val_mrr": float(val_metrics.get("MRR", 0.0)),
+            "val_r1": float(val_metrics.get("R@1", 0.0)),
+            "val_r5": float(val_metrics.get("R@5", 0.0)),
+            "val_r10": float(val_metrics.get("R@10", 0.0))
+        }
+        training_logs["epochs"].append(epoch_log)
+        
+        # Sauvegarder les logs à chaque epoch (pour pouvoir les visualiser en temps réel)
+        with open(LOGS_SAVE_PATH, 'w') as f:
+            json.dump(training_logs, f, indent=2)
+        
+        val_str = f"Loss: {val_metrics.get('val_loss', 0.0):.4f}, " if val_metrics.get('val_loss') else ""
+        val_str += f"MRR: {val_metrics.get('MRR', 0.0):.4f}, R@1: {val_metrics.get('R@1', 0.0):.4f}"
+        print(f"Epoch {ep+1:02d}/{args.epochs} | Train Loss: {train_loss:.4f} | Val: {val_str}")
 
+    training_logs["best_mrr"] = float(best_mrr)
+    with open(LOGS_SAVE_PATH, 'w') as f:
+        json.dump(training_logs, f, indent=2)
+    
     print(f"\nTraining Complete. Best Model saved to {MODEL_SAVE_PATH}")
+    print(f"Training logs saved to {LOGS_SAVE_PATH}")
     print(f"Best MRR: {best_mrr:.4f}")
 
 if __name__ == "__main__":

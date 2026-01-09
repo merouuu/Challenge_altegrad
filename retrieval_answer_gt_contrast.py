@@ -9,14 +9,16 @@ from data_utils import (
     load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
 )
 
-# CHANGEMENT 1 : On importe la classe depuis le fichier d'entrainement contrastif
-# Assure-toi que le fichier train_gt_contrast.py est bien dans le dossier
-from train_gt_contrast import MolGraphTransformer
+# Import de la classe améliorée depuis le fichier d'entrainement contrastif
+from train_gt_contrast import ImprovedMolGraphTransformer
 
 # Configuration des arguments
-parser = argparse.ArgumentParser(description="Générer une soumission Kaggle (Contrastive)")
+parser = argparse.ArgumentParser(description="Générer une soumission Kaggle (Improved Contrastive)")
 parser.add_argument('--env', type=str, default='local', choices=['local', 'colab'], 
                     help="Définir l'environnement : 'local' ou 'colab'")
+parser.add_argument('--hidden', type=int, default=128, help="Hidden dimension (doit correspondre à l'entraînement)")
+parser.add_argument('--layers', type=int, default=4, help="Number of transformer layers (doit correspondre à l'entraînement)")
+parser.add_argument('--heads', type=int, default=4, help="Number of attention heads (doit correspondre à l'entraînement)")
 args = parser.parse_args()
 
 # Chemins de base
@@ -114,9 +116,15 @@ def main():
     train_emb = load_id2emb(TRAIN_EMB_CSV)
     emb_dim = len(next(iter(train_emb.values())))
     
-    # Configuration du Modèle Contrastif
-    # CHANGEMENT 2 : On instancie le modèle (les hyperparamètres doivent être ceux de l'entrainement)
-    model = MolGraphTransformer(hidden=128, out_dim=emb_dim, layers=4, heads=4).to(DEVICE)
+    # Configuration du Modèle Amélioré (ImprovedMolGraphTransformer)
+    # IMPORTANT : Les hyperparamètres doivent correspondre exactement à ceux utilisés lors de l'entraînement
+    print(f"Initialisation du modèle amélioré (hidden={args.hidden}, layers={args.layers}, heads={args.heads})...")
+    model = ImprovedMolGraphTransformer(
+        hidden=args.hidden, 
+        out_dim=emb_dim, 
+        layers=args.layers, 
+        heads=args.heads
+    ).to(DEVICE)
     
     # CHANGEMENT 3 : Chemins spécifiques au dossier GT_Contrast
     model_path = f"{base_path}/GT_Contrast/contrastive_model.pt"
