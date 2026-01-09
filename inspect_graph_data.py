@@ -74,7 +74,8 @@ def inspect_graph_file(pkl_path, num_samples=3):
 
 
 def main():
-    base_path = "data"
+    #base_path = "data"
+    base_path = "/content/drive/MyDrive/data"
     splits = ["train", "validation", "test"]
     
     print("=" * 100)

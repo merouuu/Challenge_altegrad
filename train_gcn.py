@@ -17,13 +17,14 @@ from data_utils import (
 # =========================================================
 # CONFIG
 # =========================================================
-# Data paths
-TRAIN_GRAPHS = "data/train_graphs.pkl"
-VAL_GRAPHS   = "data/validation_graphs.pkl"
-TEST_GRAPHS  = "data/test_graphs.pkl"
+#base_path='/data'
+base_path = "/content/drive/MyDrive/data"
+TRAIN_GRAPHS = f"{base_path}/train_graphs.pkl"
+VAL_GRAPHS   = f"{base_path}/validation_graphs.pkl"
+TEST_GRAPHS  = f"{base_path}/test_graphs.pkl"
 
-TRAIN_EMB_CSV = "data/train_embeddings.csv"
-VAL_EMB_CSV   = "data/validation_embeddings.csv"
+TRAIN_EMB_CSV = f"{base_path}/train_embeddings.csv"
+VAL_EMB_CSV   = f"{base_path}/validation_embeddings.csv"
 
 # Training parameters
 BATCH_SIZE = 32

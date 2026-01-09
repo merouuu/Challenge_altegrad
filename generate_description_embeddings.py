@@ -23,8 +23,9 @@ print(f"Model loaded on: {device}")
 for split in ['train', 'validation']:
     print(f"\nProcessing {split}...")
     
+    
     # Load graphs from pkl file
-    pkl_path = f'data/{split}_graphs.pkl'
+    pkl_path = f'data/{split}_graphs.pkl' # f'/content/drive/MyDrive/data/{split}_graphs.pkl'
     print(f"Loading from {pkl_path}...")
     with open(pkl_path, 'rb') as f:
         graphs = pickle.load(f)
@@ -56,7 +57,8 @@ for split in ['train', 'validation']:
         'ID': ids,
         'embedding': [','.join(map(str, emb)) for emb in embeddings]
     })
-    output_path = f'data/{split}_embeddings.csv'
+    #output_path = f'data/{split}_embeddings.csv'
+    output_path = f'/content/drive/MyDrive/data/{split}_embeddings.csv'
     result.to_csv(output_path, index=False)
     print(f"Saved to {output_path}")
 
