@@ -409,7 +409,7 @@ def main():
     
     # Learning rate scheduler - réduit le LR si pas d'amélioration pendant 5 epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True, min_lr=1e-6
+        optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
     )
 
     best_mrr = 0.0
@@ -439,7 +439,11 @@ def main():
             val_metrics = eval_retrieval(VAL_GRAPHS, val_emb, model, DEVICE, temp=args.temp, compute_loss=True)
             
             # Scheduler step basé sur MRR
+            old_lr = optimizer.param_groups[0]['lr']
             scheduler.step(val_metrics["MRR"])
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr < old_lr:
+                print(f"  [LR Reduced] {old_lr:.2e} -> {new_lr:.2e}")
             
             if val_metrics["MRR"] > best_mrr:
                 best_mrr = val_metrics["MRR"]
