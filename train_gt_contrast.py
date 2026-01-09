@@ -26,6 +26,8 @@ parser.add_argument('--temp', type=float, default=0.07, help="Temperature for Co
 parser.add_argument('--hidden', type=int, default=128, help="Hidden dimension")
 parser.add_argument('--layers', type=int, default=4, help="Number of transformer layers")
 parser.add_argument('--heads', type=int, default=4, help="Number of attention heads")
+parser.add_argument('--resume_from', type=str, default=None, help="Path to checkpoint to resume training from (e.g., 'GT_Contrast/contrastive_model.pt')")
+parser.add_argument('--start_epoch', type=int, default=0, help="Starting epoch number (useful when resuming, will be auto-detected from logs if available)")
 args = parser.parse_args()
 
 base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
@@ -40,6 +42,7 @@ if not os.path.exists(OUTPUT_DIR):
     print(f"Created directory: {OUTPUT_DIR}")
 
 MODEL_SAVE_PATH = f"{OUTPUT_DIR}/contrastive_model.pt"
+CHECKPOINT_SAVE_PATH = f"{OUTPUT_DIR}/checkpoint.pt"  # Checkpoint complet avec optimizer/scheduler
 LOGS_SAVE_PATH = f"{OUTPUT_DIR}/training_logs.json"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -412,6 +415,8 @@ def main():
         optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
     )
 
+    # Gestion de la reprise d'entraînement
+    start_epoch = 0
     best_mrr = 0.0
     training_logs = {
         "config": {
@@ -426,7 +431,96 @@ def main():
         "epochs": []
     }
     
-    for ep in range(args.epochs):
+    # Charger le checkpoint si spécifié
+    if args.resume_from:
+        checkpoint_path = f"{base_path}/{args.resume_from}" if not args.resume_from.startswith('/') else args.resume_from
+        
+        # Essayer d'abord de charger le checkpoint complet
+        full_checkpoint_path = f"{base_path}/GT_Contrast/checkpoint.pt"
+        if os.path.exists(full_checkpoint_path):
+            print(f"\n🔄 Chargement du checkpoint complet: {full_checkpoint_path}")
+            checkpoint = torch.load(full_checkpoint_path, map_location=DEVICE)
+            
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Restaurer le scheduler si possible
+            if 'scheduler_state_dict' in checkpoint:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except:
+                    print("⚠️  Impossible de restaurer l'état du scheduler, utilisation de l'état actuel")
+            
+            best_mrr = checkpoint.get('best_mrr', 0.0)
+            start_epoch = checkpoint.get('epoch', 0)
+            restored_lr = checkpoint.get('learning_rate', args.lr)
+            
+            # Restaurer le LR dans l'optimizer (important car le scheduler peut ne pas être restauré)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = restored_lr
+            
+            print("✅ Checkpoint complet chargé avec succès")
+            print(f"📊 Epoch: {start_epoch}")
+            print(f"📊 Meilleur MRR: {best_mrr:.4f}")
+            print(f"📊 Learning Rate restauré: {restored_lr:.6f}")
+            
+            # Charger les logs pour récupérer l'historique complet
+            logs_path = f"{base_path}/GT_Contrast/training_logs.json"
+            if os.path.exists(logs_path):
+                with open(logs_path, 'r') as f:
+                    old_logs = json.load(f)
+                    if old_logs.get("epochs"):
+                        training_logs["epochs"] = old_logs["epochs"]
+                        print(f"📊 Historique chargé: {len(old_logs['epochs'])} epochs")
+            
+            # Utiliser start_epoch manuel si fourni
+            if args.start_epoch > 0:
+                start_epoch = args.start_epoch - 1
+                print(f"📊 Utilisation de l'epoch de départ manuel: {start_epoch + 1}")
+                
+        elif os.path.exists(checkpoint_path):
+            # Fallback: charger seulement le modèle (ancien format)
+            print(f"\n🔄 Chargement du modèle uniquement: {checkpoint_path}")
+            print("⚠️  Checkpoint complet non trouvé, chargement du modèle seulement")
+            model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+            print("✅ Modèle chargé avec succès")
+            
+            # Essayer de charger les logs pour récupérer l'historique et le LR
+            logs_path = f"{base_path}/GT_Contrast/training_logs.json"
+            if os.path.exists(logs_path):
+                with open(logs_path, 'r') as f:
+                    old_logs = json.load(f)
+                    if old_logs.get("epochs"):
+                        start_epoch = len(old_logs["epochs"])
+                        best_mrr = old_logs.get("best_mrr", 0.0)
+                        training_logs["epochs"] = old_logs["epochs"]
+                        
+                        # Récupérer le dernier LR depuis les logs
+                        if old_logs["epochs"]:
+                            last_epoch_log = old_logs["epochs"][-1]
+                            last_lr = last_epoch_log.get("learning_rate", args.lr)
+                            # Ajuster le LR de l'optimizer
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] = last_lr
+                            print(f"📊 Learning Rate restauré depuis les logs: {last_lr:.6f}")
+                        
+                        print(f"📊 Reprise depuis l'epoch {start_epoch + 1}")
+                        print(f"📊 Meilleur MRR précédent: {best_mrr:.4f}")
+            
+            # Utiliser start_epoch si fourni manuellement
+            if args.start_epoch > 0:
+                start_epoch = args.start_epoch - 1
+                print(f"📊 Utilisation de l'epoch de départ manuel: {start_epoch + 1}")
+        else:
+            print(f"⚠️  Checkpoint non trouvé: {checkpoint_path}")
+            print("   Démarrage d'un nouvel entraînement...")
+    
+    # Ajuster le nombre total d'epochs si on reprend
+    total_epochs = args.epochs
+    if start_epoch > 0:
+        print(f"\n📈 Entraînement: epochs {start_epoch + 1} à {total_epochs}")
+    
+    for ep in range(start_epoch, total_epochs):
         train_loss = train_epoch(model, train_dl, optimizer, DEVICE, args.temp)
         
         # Récupérer le learning rate actuel
@@ -447,7 +541,23 @@ def main():
             
             if val_metrics["MRR"] > best_mrr:
                 best_mrr = val_metrics["MRR"]
+                # Sauvegarder le modèle (pour compatibilité)
                 torch.save(model.state_dict(), MODEL_SAVE_PATH)
+                # Sauvegarder un checkpoint complet (modèle + optimizer + état)
+                checkpoint = {
+                    'epoch': ep + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_mrr': best_mrr,
+                    'learning_rate': optimizer.param_groups[0]['lr'],
+                    'val_mrr': val_metrics["MRR"]  # Pour restaurer l'état du scheduler
+                }
+                # Essayer de sauvegarder le scheduler si possible
+                try:
+                    checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+                except:
+                    pass  # ReduceLROnPlateau n'a pas toujours de state_dict
+                torch.save(checkpoint, CHECKPOINT_SAVE_PATH)
                 print(f"  [New Best Model Saved] MRR: {best_mrr:.4f}")
 
         # Enregistrer les logs
@@ -469,13 +579,16 @@ def main():
         
         val_str = f"Loss: {val_metrics.get('val_loss', 0.0):.4f}, " if val_metrics.get('val_loss') else ""
         val_str += f"MRR: {val_metrics.get('MRR', 0.0):.4f}, R@1: {val_metrics.get('R@1', 0.0):.4f}"
-        print(f"Epoch {ep+1:02d}/{args.epochs} | Train Loss: {train_loss:.4f} | Val: {val_str}")
+        print(f"Epoch {ep+1:02d}/{total_epochs} | Train Loss: {train_loss:.4f} | Val: {val_str}")
 
     training_logs["best_mrr"] = float(best_mrr)
     with open(LOGS_SAVE_PATH, 'w') as f:
         json.dump(training_logs, f, indent=2)
     
-    print(f"\nTraining Complete. Best Model saved to {MODEL_SAVE_PATH}")
+    if start_epoch > 0:
+        print(f"\n✅ Entraînement repris et complété. Epochs {start_epoch + 1} à {total_epochs} terminés.")
+    else:
+        print(f"\nTraining Complete. Best Model saved to {MODEL_SAVE_PATH}")
     print(f"Training logs saved to {LOGS_SAVE_PATH}")
     print(f"Best MRR: {best_mrr:.4f}")
 
