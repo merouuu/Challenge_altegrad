@@ -107,7 +107,6 @@ def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, 
 
 def main():
     print(f"Environnement : {args.env}")
-    print(f"Modèle choisi : {args.model}")
     print(f"Device : {DEVICE}")
     
     # Vérification des fichiers
@@ -128,7 +127,6 @@ def main():
     # Chargement des poids
     if not os.path.exists(model_path):
         print(f"Erreur : Checkpoint non trouvé à {model_path}")
-        print(f"Avez-vous entraîné le modèle {args.model} ?")
         return
 
     print(f"Chargement des poids depuis {model_path}...")
