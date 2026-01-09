@@ -7,6 +7,9 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
 
+base_path = "/content/drive/MyDrive/data"
+base_path = '/data'
+
 # Configuration
 MAX_TOKEN_LENGTH = 128
 
@@ -25,7 +28,7 @@ for split in ['train', 'validation']:
     
     
     # Load graphs from pkl file
-    pkl_path = f'data/{split}_graphs.pkl' # f'/content/drive/MyDrive/data/{split}_graphs.pkl'
+    pkl_path = f'{base_path}/{split}_graphs.pkl'
     print(f"Loading from {pkl_path}...")
     with open(pkl_path, 'rb') as f:
         graphs = pickle.load(f)
@@ -57,8 +60,7 @@ for split in ['train', 'validation']:
         'ID': ids,
         'embedding': [','.join(map(str, emb)) for emb in embeddings]
     })
-    #output_path = f'data/{split}_embeddings.csv'
-    output_path = f'/content/drive/MyDrive/data/{split}_embeddings.csv'
+    output_path = f'{base_path}/{split}_embeddings.csv'
     result.to_csv(output_path, index=False)
     print(f"Saved to {output_path}")
 
