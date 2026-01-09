@@ -25,8 +25,8 @@ args = parser.parse_args()
 base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
 TRAIN_GRAPHS = f"{base_path}/train_graphs.pkl"
 VAL_GRAPHS   = f"{base_path}/validation_graphs.pkl"
-TRAIN_EMB_CSV = f"{base_path}/GT/train_embeddings.csv"
-VAL_EMB_CSV   = f"{base_path}/GT/validation_embeddings.csv"
+TRAIN_EMB_CSV = f"{base_path}/train_embeddings.csv"
+VAL_EMB_CSV   = f"{base_path}/validation_embeddings.csv"
 MODEL_SAVE_PATH = f"{base_path}/GT/transformer_model.pt"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
