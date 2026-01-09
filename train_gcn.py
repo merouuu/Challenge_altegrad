@@ -27,8 +27,8 @@ TRAIN_GRAPHS = f"{base_path}/train_graphs.pkl"
 VAL_GRAPHS   = f"{base_path}/validation_graphs.pkl"
 TEST_GRAPHS  = f"{base_path}/test_graphs.pkl"
 
-TRAIN_EMB_CSV = f"{base_path}/train_embeddings.csv"
-VAL_EMB_CSV   = f"{base_path}/validation_embeddings.csv"
+TRAIN_EMB_CSV = f"{base_path}/GCN/train_embeddings.csv"
+VAL_EMB_CSV   = f"{base_path}/GCN/validation_embeddings.csv"
 
 # Training parameters
 BATCH_SIZE = 32
@@ -161,7 +161,7 @@ def main():
             val_scores = {}
         print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
     
-    model_path = f"{base_path}/model_checkpoint.pt"
+    model_path = f"{base_path}/GCN/model_checkpoint.pt"
     torch.save(mol_enc.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 
