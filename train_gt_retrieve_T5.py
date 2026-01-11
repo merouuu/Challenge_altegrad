@@ -407,7 +407,7 @@ class T5RewriteDataset(Dataset):
 
 @dataclass
 class T5Collator:
-    tokenizer
+    tokenizer: object
     label_pad_token_id: int = -100
 
     def __call__(self, batch):
