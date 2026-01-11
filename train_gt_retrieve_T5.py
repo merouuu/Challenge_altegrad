@@ -575,7 +575,7 @@ def main():
     ).to(device)
 
     sd = torch.load(args.graph_ckpt, map_location=device)
-    graph_encoder.load_state_dict(sd)
+    graph_encoder.load_state_dict(sd, strict=False)
     graph_encoder.eval()
     for p in graph_encoder.parameters():
         p.requires_grad = False
