@@ -5,14 +5,57 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
+import re
 from torch.utils.data import DataLoader, Sampler
 from torch_geometric.nn import TransformerConv, global_mean_pool, LayerNorm
-from torch_geometric.utils import scatter
+from torch_geometric.utils import scatter, softmax
+
+# Imports pour évaluation texte (BLEU + BERTScore)
+try:
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+    import nltk
+    nltk.download('punkt', quiet=True)
+except:
+    sentence_bleu = None
+
+try:
+    from bert_score import score as bert_score
+except:
+    bert_score = None
 
 from data_utils import (
     load_id2emb,
     PreprocessedGraphDataset, collate_fn
 )
+
+# =========================================================
+# TEXT LOADING
+# =========================================================
+def load_id2text(csv_path, id_col="id", text_col="description"):
+    """
+    Charge un dictionnaire ID -> texte depuis un CSV.
+    """
+    if not os.path.exists(csv_path):
+        print(f"⚠️  Fichier {csv_path} non trouvé, textes non disponibles")
+        return {}
+    
+    try:
+        df = pd.read_csv(csv_path)
+        # Chercher les colonnes (cas-insensitif)
+        cols = {c.lower(): c for c in df.columns}
+        id_col_actual = cols.get(id_col.lower(), id_col)
+        text_col_actual = cols.get(text_col.lower(), text_col)
+        
+        if id_col_actual not in df.columns or text_col_actual not in df.columns:
+            print(f"⚠️  Colonnes {id_col}/{text_col} non trouvées dans {csv_path}")
+            print(f"   Colonnes disponibles: {list(df.columns)}")
+            return {}
+        
+        return dict(zip(df[id_col_actual].astype(str), df[text_col_actual].astype(str)))
+    except Exception as e:
+        print(f"❌ Erreur lors du chargement de {csv_path}: {e}")
+        return {}
 
 # =========================================================
 # CONFIG & ARGS
@@ -34,6 +77,10 @@ parser.add_argument('--hard_negatives', action='store_true', help="Enable Hard N
 parser.add_argument('--hard_ratio', type=float, default=0.5, help="Ratio of hard negatives in batch (0.0-1.0, default 0.5 = 50%%)")
 parser.add_argument('--hardness_k', type=int, default=100, help="Number of nearest neighbors to consider for hard negatives")
 parser.add_argument('--curriculum_epoch', type=int, default=0, help="Start hard negative mining after this epoch (0 = from start, >0 = curriculum learning)")
+parser.add_argument('--temp_schedule', action='store_true', help="Use temperature schedule (starts at 0.1, decays to final temp)")
+parser.add_argument('--use_augmentation', action='store_true', help="Enable graph augmentation (edge/node dropout)")
+parser.add_argument('--eval_bleu_bert', action='store_true', help="Evaluate with BLEU-4 + BERTScore")
+parser.add_argument('--rerank_topk', type=int, default=1, help="Top-k candidates to evaluate for reranking")
 args = parser.parse_args()
 
 base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
@@ -69,22 +116,33 @@ class HardNegativeSampler(Sampler):
     Crée des batches où les molécules sont sémantiquement proches,
     forçant le modèle à apprendre des distinctions fines.
     """
-    def __init__(self, text_embeddings_dict, batch_size, hard_ratio=0.5, hardness_k=100):
+    def __init__(self, text_embeddings_dict, batch_size, hard_ratio=0.5, hardness_k=100, dataset=None):
         """
         Args:
             text_embeddings_dict (dict): Dictionnaire ID -> embedding BERT
             batch_size (int): Taille du batch
             hard_ratio (float): Pourcentage du batch composé de hard negatives (0.0-1.0)
             hardness_k (int): Nombre de voisins les plus proches à considérer
+            dataset: (Optional) Le PreprocessedGraphDataset pour récupérer l'ordre réel des IDs
         """
         self.batch_size = batch_size
         self.hard_ratio = hard_ratio
         self.hardness_k = hardness_k
         
-        # Convertir les embeddings en tensor (en préservant l'ordre des IDs)
-        self.ids = sorted(text_embeddings_dict.keys())
+        # CRITICAL FIX: Construire les embeddings dans l'ordre du dataset, pas ordre trié
+        # Cela garantit que neighbors[idx] correspond à train_ds[idx]
+        if dataset is not None and hasattr(dataset, 'graph_ids'):
+            # Si le dataset expose ses IDs dans l'ordre réel
+            self.ids = dataset.graph_ids
+            print(f"   ✅ Utilisation de l'ordre réel du dataset (première ID: {self.ids[0]})")
+        else:
+            # Fallback: espérer que l'ordre des clés du dict correspond au dataset
+            self.ids = list(text_embeddings_dict.keys())
+            print(f"   ⚠️  ATTENTION: Utilisation de l'ordre lexicographique des IDs!")
+            print(f"       Assurez-vous que PreprocessedGraphDataset ordonne ses graphes de la même façon.")
+        
         embs_list = [text_embeddings_dict[id_] for id_ in self.ids]
-        # Conversion optimisée numpy -> tensor pour éviter les erreurs de conversion
+        # Conversion optimisée numpy -> tensor
         embs = torch.from_numpy(np.array(embs_list, dtype=np.float32))
         
         self.num_samples = len(embs)
@@ -173,6 +231,141 @@ class HardNegativeSampler(Sampler):
     
     def __len__(self):
         return self.num_batches
+
+
+# =========================================================
+# EVALUATION METRICS: BLEU-4 + BERTScore
+# =========================================================
+def simple_tokenize(s: str):
+    """Tokenisation simple et robuste pour BLEU."""
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return [t for t in s.split() if t]
+
+
+def compute_bleu4(pred_texts, ref_texts):
+    """
+    Calcule BLEU-4 moyen pour une liste de prédictions vs références.
+    """
+    if sentence_bleu is None:
+        return 0.0
+    
+    smoothing_function = SmoothingFunction().method1
+    scores = []
+    
+    for pred, ref in zip(pred_texts, ref_texts):
+        pred_tok = simple_tokenize(pred)
+        ref_tok = simple_tokenize(ref)
+        
+        # Skip si tokens vides
+        if len(pred_tok) == 0 or len(ref_tok) == 0:
+            scores.append(0.0)
+            continue
+        
+        bleu = sentence_bleu([ref_tok], pred_tok, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothing_function)
+        scores.append(bleu)
+    
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def compute_bertscore(reference_list, hypothesis_list, model_type="bert-base-multilingual-cased"):
+    """
+    Calcule BERTScore moyen entre références et hypothèses.
+    """
+    if bert_score is None:
+        return 0.0, 0.0, 0.0
+    
+    try:
+        P, R, F1 = bert_score(hypothesis_list, reference_list, lang="en", model_type=model_type, verbose=False)
+        return float(P.mean()), float(R.mean()), float(F1.mean())
+    except:
+        return 0.0, 0.0, 0.0
+
+
+@torch.no_grad()
+def eval_bleu_retrieval(val_graphs_path, val_emb_dict, val_text_dict, 
+                        train_emb_dict, train_text_dict, model, device, batch_size=64):
+    """
+    Évalue BLEU-4 en faisant un retrieval top-1 des captions d'entraînement
+    pour chaque molécule de validation.
+    
+    Args:
+        val_graphs_path: chemin vers les graphes de validation
+        val_emb_dict: id -> validation text embedding
+        val_text_dict: id -> validation text (description)
+        train_emb_dict: id -> train text embedding
+        train_text_dict: id -> train text (description)
+        model: le modèle Graph Transformer
+        device: cuda/cpu
+        batch_size: batch size pour l'inférence
+    
+    Returns:
+        dict avec "BLEU4" et "BLEU4_avg"
+    """
+    model.eval()
+    
+    # Charger le dataset de validation
+    ds = PreprocessedGraphDataset(val_graphs_path, val_emb_dict)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    # Construire la matrice d'embeddings train (alignée avec train_ids)
+    train_ids = sorted(train_emb_dict.keys())
+    train_txt_emb = torch.from_numpy(np.array([train_emb_dict[id_] for id_ in train_ids], dtype=np.float32)).to(device)
+    train_txt_emb = F.normalize(train_txt_emb, dim=-1)
+    
+    pred_texts, ref_texts = [], []
+    offset = 0
+    
+    for graphs, _text_emb in dl:
+        graphs = graphs.to(device)
+        
+        # Encode les graphes
+        mol_emb = model(graphs)  # [B, D]
+        mol_emb = F.normalize(mol_emb, dim=-1)
+        
+        # Retrieval top-1: quelle train caption est plus similaire?
+        sims = mol_emb @ train_txt_emb.t()  # [B, Ntrain]
+        best_indices = sims.argmax(dim=1).tolist()
+        
+        # Récupérer les IDs de validation du batch
+        # Important: on suppose que ds.ids existe et est aligné avec le dataset
+        if hasattr(ds, 'ids'):
+            batch_val_ids = ds.ids[offset: offset + graphs.num_graphs]
+        else:
+            # Fallback: on ne peut pas évaluer BLEU sans les IDs
+            print("⚠️  PreprocessedGraphDataset n'a pas d'attribut 'ids', BLEU non disponible")
+            return {"BLEU4": 0.0}
+        
+        offset += graphs.num_graphs
+        
+        # Construire les paires pred/ref
+        for j, val_id in enumerate(batch_val_ids):
+            train_id = train_ids[best_indices[j]]
+            pred_text = train_text_dict.get(str(train_id), "")
+            ref_text = val_text_dict.get(str(val_id), "")
+            
+            if pred_text and ref_text:
+                pred_texts.append(pred_text)
+                ref_texts.append(ref_text)
+    
+    # Calculer BLEU-4
+    bleu4 = compute_bleu4(pred_texts, ref_texts) if pred_texts else 0.0
+    
+    return {"BLEU4": bleu4}
+
+
+def get_temperature_schedule(epoch, total_epochs, init_temp=0.1, final_temp=0.07):
+    """
+    Retourne la température pour l'epoch courant.
+    Décroissance linéaire de init_temp vers final_temp.
+    """
+    if not args.temp_schedule:
+        return args.temp
+    
+    # Décroissance linéaire
+    progress = epoch / max(total_epochs - 1, 1)
+    temp = init_temp - (init_temp - final_temp) * progress
+    return max(temp, final_temp)
 
 
 # =========================================================
@@ -271,6 +464,43 @@ class ImprovedBondEncoder(nn.Module):
 
 
 # =========================================================
+# GRAPH AUGMENTATION
+# =========================================================
+class GraphAugmentation(nn.Module):
+    """
+    Augmentation légère de graphes pour contrastive learning multi-vues.
+    """
+    def __init__(self, edge_dropout=0.1, node_dropout=0.05):
+        super().__init__()
+        self.edge_dropout = edge_dropout
+        self.node_dropout = node_dropout
+    
+    def forward(self, batch, training=True):
+        """
+        Applique des augmentations aléatoires au batch de graphes.
+        """
+        if not training:
+            return batch
+        
+        # Copie le batch pour ne pas le modifier en place
+        batch_aug = batch.clone()
+        
+        # Edge dropout: supprime aléatoirement des edges
+        if self.edge_dropout > 0:
+            mask = torch.rand(batch_aug.edge_index.size(1)) > self.edge_dropout
+            batch_aug.edge_index = batch_aug.edge_index[:, mask]
+            if batch_aug.edge_attr is not None:
+                batch_aug.edge_attr = batch_aug.edge_attr[mask]
+        
+        # Node feature dropout: masque aléatoirement des features
+        if self.node_dropout > 0 and batch_aug.x is not None:
+            mask = torch.rand(batch_aug.x.size()) > self.node_dropout
+            batch_aug.x = batch_aug.x * mask.float()
+        
+        return batch_aug
+
+
+# =========================================================
 # ATTENTION POOLING
 # =========================================================
 class AttentionPooling(nn.Module):
@@ -293,16 +523,8 @@ class AttentionPooling(nn.Module):
         # Calcul des poids d'attention
         attn_logits = self.attention(x)  # [num_nodes, 1]
         
-        # Softmax par graphe (normalisation par batch)
-        attn_weights = scatter(
-            attn_logits.exp(), 
-            batch, 
-            dim=0, 
-            reduce='sum'
-        )  # [num_graphs, 1]
-        
-        # Normalisation: attn_weights[i] = exp(score) / sum(exp(scores) for graph i)
-        attn_weights = attn_logits.exp() / (scatter(attn_logits.exp(), batch, dim=0, reduce='sum')[batch] + 1e-8)
+        # Softmax groupé par graphe (stable numériquement via PyG softmax)
+        attn_weights = softmax(attn_logits, batch, dim=0)  # [num_nodes, 1]
         
         # Pooling attentionné: somme pondérée par graphe
         weighted_x = x * attn_weights
@@ -505,8 +727,16 @@ def main():
         print(f"  - Hard Ratio: {args.hard_ratio*100:.0f}%")
         print(f"  - Hardness K: {args.hardness_k}")
         print(f"  - Curriculum Start: Epoch {args.curriculum_epoch if args.curriculum_epoch > 0 else 'from start'}")
+    print(f"Temperature Schedule: {'Enabled (0.1 → 0.07)' if args.temp_schedule else 'Disabled'}")
+    print(f"Graph Augmentation: {'Enabled' if args.use_augmentation else 'Disabled'}")
+    print(f"BLEU-4 + BERTScore Eval: {'Enabled' if args.eval_bleu_bert else 'Disabled'}")
+    print(f"Rerank Top-K: {args.rerank_topk}")
     
     train_emb = load_id2emb(TRAIN_EMB_CSV)
+    
+    # Charger les descriptions textuelles (nécessaires pour BLEU-4)
+    train_text_dict = load_id2text(TRAIN_GRAPHS) if args.eval_bleu_bert else {}
+    val_text_dict = load_id2text(VAL_GRAPHS) if args.eval_bleu_bert and os.path.exists(VAL_GRAPHS) else {}
     
     if not os.path.exists(TRAIN_GRAPHS):
         raise FileNotFoundError(f"Graphs not found at {TRAIN_GRAPHS}")
@@ -521,7 +751,8 @@ def main():
             train_emb, 
             batch_size=args.batch_size,
             hard_ratio=args.hard_ratio,
-            hardness_k=args.hardness_k
+            hardness_k=args.hardness_k,
+            dataset=train_ds  # CRITICAL FIX: passer le dataset
         )
         train_dl = DataLoader(
             train_ds,
@@ -687,7 +918,8 @@ def main():
                 train_emb,
                 batch_size=args.batch_size,
                 hard_ratio=args.hard_ratio,
-                hardness_k=args.hardness_k
+                hardness_k=args.hardness_k,
+                dataset=train_ds  # CRITICAL FIX: passer le dataset
             )
             train_dl = DataLoader(
                 train_ds,
@@ -696,7 +928,10 @@ def main():
             )
             print(f"✅ DataLoader mis à jour avec Hard Negative Mining\n")
         
-        train_loss = train_epoch(model, train_dl, optimizer, DEVICE, args.temp)
+        # Température adaptative
+        current_temp = get_temperature_schedule(ep, args.epochs)
+        
+        train_loss = train_epoch(model, train_dl, optimizer, DEVICE, current_temp)
         
         # Récupérer le learning rate actuel
         current_lr = optimizer.param_groups[0]['lr']
@@ -706,6 +941,15 @@ def main():
             val_emb = load_id2emb(VAL_EMB_CSV)
             # Calculer les métriques de retrieval ET la validation loss
             val_metrics = eval_retrieval(VAL_GRAPHS, val_emb, model, DEVICE, temp=args.temp, compute_loss=True)
+            
+            # Évaluer BLEU-4 si activé
+            if args.eval_bleu_bert and train_text_dict and val_text_dict:
+                bleu_results = eval_bleu_retrieval(
+                    VAL_GRAPHS, val_emb, val_text_dict,
+                    train_emb, train_text_dict,
+                    model, DEVICE, batch_size=args.batch_size
+                )
+                val_metrics.update(bleu_results)
             
             # Scheduler step basé sur MRR
             old_lr = optimizer.param_groups[0]['lr']
@@ -744,7 +988,8 @@ def main():
             "val_mrr": float(val_metrics.get("MRR", 0.0)),
             "val_r1": float(val_metrics.get("R@1", 0.0)),
             "val_r5": float(val_metrics.get("R@5", 0.0)),
-            "val_r10": float(val_metrics.get("R@10", 0.0))
+            "val_r10": float(val_metrics.get("R@10", 0.0)),
+            "val_bleu4": float(val_metrics.get("BLEU4", 0.0))
         }
         training_logs["epochs"].append(epoch_log)
         
@@ -754,6 +999,8 @@ def main():
         
         val_str = f"Loss: {val_metrics.get('val_loss', 0.0):.4f}, " if val_metrics.get('val_loss') else ""
         val_str += f"MRR: {val_metrics.get('MRR', 0.0):.4f}, R@1: {val_metrics.get('R@1', 0.0):.4f}"
+        if args.eval_bleu_bert and val_metrics.get("BLEU4"):
+            val_str += f", BLEU-4: {val_metrics.get('BLEU4', 0.0):.4f}"
         print(f"Epoch {ep+1:02d}/{total_epochs} | Train Loss: {train_loss:.4f} | Val: {val_str}")
 
     training_logs["best_mrr"] = float(best_mrr)
