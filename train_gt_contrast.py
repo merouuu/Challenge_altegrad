@@ -4,7 +4,8 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import numpy as np
+from torch.utils.data import DataLoader, Sampler
 from torch_geometric.nn import TransformerConv, global_mean_pool, LayerNorm
 from torch_geometric.utils import scatter
 
@@ -28,6 +29,11 @@ parser.add_argument('--layers', type=int, default=4, help="Number of transformer
 parser.add_argument('--heads', type=int, default=4, help="Number of attention heads")
 parser.add_argument('--resume_from', type=str, default=None, help="Path to checkpoint to resume training from (e.g., 'GT_Contrast/contrastive_model.pt')")
 parser.add_argument('--start_epoch', type=int, default=0, help="Starting epoch number (useful when resuming, will be auto-detected from logs if available)")
+parser.add_argument('--run_id', type=str, default=None, help="Unique run ID for grid search (saves to GT_Contrast/run_{run_id}/)")
+parser.add_argument('--hard_negatives', action='store_true', help="Enable Hard Negative Mining with semantics-aware batching")
+parser.add_argument('--hard_ratio', type=float, default=0.5, help="Ratio of hard negatives in batch (0.0-1.0, default 0.5 = 50%%)")
+parser.add_argument('--hardness_k', type=int, default=100, help="Number of nearest neighbors to consider for hard negatives")
+parser.add_argument('--curriculum_epoch', type=int, default=0, help="Start hard negative mining after this epoch (0 = from start, >0 = curriculum learning)")
 args = parser.parse_args()
 
 base_path = "/content/drive/MyDrive/data" if args.env == 'colab' else "data"
@@ -36,7 +42,12 @@ VAL_GRAPHS   = f"{base_path}/validation_graphs.pkl"
 TRAIN_EMB_CSV = f"{base_path}/train_embeddings.csv"
 VAL_EMB_CSV   = f"{base_path}/validation_embeddings.csv"
 
-OUTPUT_DIR = f"{base_path}/GT_Contrast"
+# Gestion du run_id pour grid search
+if args.run_id:
+    OUTPUT_DIR = f"{base_path}/GT_Contrast/run_{args.run_id}"
+else:
+    OUTPUT_DIR = f"{base_path}/GT_Contrast"
+
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"Created directory: {OUTPUT_DIR}")
@@ -46,6 +57,121 @@ CHECKPOINT_SAVE_PATH = f"{OUTPUT_DIR}/checkpoint.pt"  # Checkpoint complet avec 
 LOGS_SAVE_PATH = f"{OUTPUT_DIR}/training_logs.json"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# =========================================================
+# HARD NEGATIVE SAMPLER
+# =========================================================
+class HardNegativeSampler(Sampler):
+    """
+    Semantics-Aware Batch Sampler pour Hard Negative Mining.
+    
+    Crée des batches où les molécules sont sémantiquement proches,
+    forçant le modèle à apprendre des distinctions fines.
+    """
+    def __init__(self, text_embeddings_dict, batch_size, hard_ratio=0.5, hardness_k=100):
+        """
+        Args:
+            text_embeddings_dict (dict): Dictionnaire ID -> embedding BERT
+            batch_size (int): Taille du batch
+            hard_ratio (float): Pourcentage du batch composé de hard negatives (0.0-1.0)
+            hardness_k (int): Nombre de voisins les plus proches à considérer
+        """
+        self.batch_size = batch_size
+        self.hard_ratio = hard_ratio
+        self.hardness_k = hardness_k
+        
+        # Convertir les embeddings en tensor (en préservant l'ordre des IDs)
+        self.ids = sorted(text_embeddings_dict.keys())
+        embs_list = [text_embeddings_dict[id_] for id_ in self.ids]
+        embs = torch.tensor(embs_list, dtype=torch.float32)
+        
+        self.num_samples = len(embs)
+        self.num_batches = self.num_samples // batch_size
+        
+        # Calcul des Hard Negatives (pré-computation)
+        print(f"\n🧲 Pré-calcul des Hard Negatives (Similarity Matrix)...")
+        print(f"   Dataset size: {self.num_samples}")
+        print(f"   Hard ratio: {hard_ratio*100:.0f}%, K neighbors: {hardness_k}")
+        
+        # Normalisation pour cosine similarity
+        embs = F.normalize(embs, dim=1)
+        
+        # Calcul des K voisins les plus proches (par chunks pour gérer la RAM)
+        self.neighbors = []
+        chunk_size = 1000
+        
+        for i in range(0, len(embs), chunk_size):
+            end = min(i + chunk_size, len(embs))
+            # Similarité du chunk courant avec tout le dataset
+            sims = embs[i:end] @ embs.t()
+            
+            # Mettre à -inf la diagonale pour ne pas se sélectionner soi-même
+            for j in range(sims.size(0)):
+                sims[j, i+j] = -float('inf')
+            
+            # Top-k plus proches voisins
+            k = min(hardness_k, self.num_samples - 1)
+            _, indices = sims.topk(k, dim=1)
+            self.neighbors.extend(indices.tolist())
+            
+            if (i // chunk_size) % 10 == 0:
+                print(f"   Processed {min(i+chunk_size, len(embs))}/{len(embs)} samples...")
+        
+        print("✅ Hard Negatives indexés.\n")
+    
+    def __iter__(self):
+        # Mélanger les indices de départ
+        all_indices = np.arange(self.num_samples)
+        np.random.shuffle(all_indices)
+        
+        n_hard = int(self.batch_size * self.hard_ratio)
+        n_rand = self.batch_size - n_hard
+        
+        used_indices = set()
+        batches = []
+        
+        for idx in all_indices:
+            if idx in used_indices:
+                continue
+            
+            batch = [idx]
+            used_indices.add(idx)
+            
+            # 1. Ajouter des Hard Negatives (voisins proches)
+            if n_hard > 0 and len(self.neighbors[idx]) > 0:
+                candidates = self.neighbors[idx].copy()
+                np.random.shuffle(candidates)
+                
+                count_h = 0
+                for neighbor in candidates:
+                    if count_h >= n_hard - 1:  # -1 car on a déjà ajouté idx
+                        break
+                    if neighbor not in used_indices:
+                        batch.append(neighbor)
+                        used_indices.add(neighbor)
+                        count_h += 1
+            
+            # 2. Compléter avec des Random Negatives
+            attempts = 0
+            max_attempts = self.num_samples * 2
+            while len(batch) < self.batch_size and attempts < max_attempts:
+                rand_idx = np.random.randint(0, self.num_samples)
+                if rand_idx not in used_indices:
+                    batch.append(rand_idx)
+                    used_indices.add(rand_idx)
+                attempts += 1
+            
+            # Si le batch est complet, le sauvegarder
+            if len(batch) == self.batch_size:
+                batches.append(batch)
+        
+        # Retourner les batches
+        for batch in batches:
+            yield batch
+    
+    def __len__(self):
+        return self.num_batches
 
 
 # =========================================================
@@ -373,6 +499,11 @@ def main():
     print(f"Data Path: {base_path}")
     print(f"Loss: Contrastive (Temp={args.temp})")
     print(f"Architecture: Improved Transformer (hidden={args.hidden}, layers={args.layers}, heads={args.heads})")
+    print(f"Hard Negative Mining: {'Enabled' if args.hard_negatives else 'Disabled'}")
+    if args.hard_negatives:
+        print(f"  - Hard Ratio: {args.hard_ratio*100:.0f}%")
+        print(f"  - Hardness K: {args.hardness_k}")
+        print(f"  - Curriculum Start: Epoch {args.curriculum_epoch if args.curriculum_epoch > 0 else 'from start'}")
     
     train_emb = load_id2emb(TRAIN_EMB_CSV)
     
@@ -380,14 +511,40 @@ def main():
         raise FileNotFoundError(f"Graphs not found at {TRAIN_GRAPHS}")
 
     train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
-    # Drop_last=True important pour la loss contrastive
-    train_dl = DataLoader(
-        train_ds, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        collate_fn=collate_fn, 
-        drop_last=True
-    )
+    
+    # Créer le DataLoader avec ou sans Hard Negative Sampler
+    if args.hard_negatives and args.curriculum_epoch == 0:
+        # Hard Negative Mining dès le début
+        print("\n🎯 Initialisation du Hard Negative Sampler...")
+        sampler = HardNegativeSampler(
+            train_emb, 
+            batch_size=args.batch_size,
+            hard_ratio=args.hard_ratio,
+            hardness_k=args.hardness_k
+        )
+        train_dl = DataLoader(
+            train_ds,
+            batch_sampler=sampler,
+            collate_fn=collate_fn
+        )
+        print(f"✅ DataLoader configuré avec Hard Negative Mining\n")
+    else:
+        # Mode standard (shuffle random) ou curriculum learning
+        if args.hard_negatives and args.curriculum_epoch > 0:
+            print(f"\n📚 Curriculum Learning: Random sampling jusqu'à l'epoch {args.curriculum_epoch}")
+            print(f"   Hard Negative Mining démarrera à l'epoch {args.curriculum_epoch + 1}\n")
+        train_dl = DataLoader(
+            train_ds, 
+            batch_size=args.batch_size, 
+            shuffle=True, 
+            collate_fn=collate_fn, 
+            drop_last=True
+        )
+    
+    # Sauvegarder le sampler pour curriculum learning
+    hard_sampler = None
+    if args.hard_negatives and args.curriculum_epoch > 0:
+        hard_sampler = None  # Sera créé plus tard
 
     emb_dim = len(next(iter(train_emb.values())))
     
@@ -436,7 +593,7 @@ def main():
         checkpoint_path = f"{base_path}/{args.resume_from}" if not args.resume_from.startswith('/') else args.resume_from
         
         # Essayer d'abord de charger le checkpoint complet
-        full_checkpoint_path = f"{base_path}/GT_Contrast/checkpoint.pt"
+        full_checkpoint_path = f"{OUTPUT_DIR}/checkpoint.pt"
         if os.path.exists(full_checkpoint_path):
             print(f"\n🔄 Chargement du checkpoint complet: {full_checkpoint_path}")
             checkpoint = torch.load(full_checkpoint_path, map_location=DEVICE)
@@ -465,7 +622,7 @@ def main():
             print(f"📊 Learning Rate restauré: {restored_lr:.6f}")
             
             # Charger les logs pour récupérer l'historique complet
-            logs_path = f"{base_path}/GT_Contrast/training_logs.json"
+            logs_path = f"{OUTPUT_DIR}/training_logs.json"
             if os.path.exists(logs_path):
                 with open(logs_path, 'r') as f:
                     old_logs = json.load(f)
@@ -486,7 +643,7 @@ def main():
             print("✅ Modèle chargé avec succès")
             
             # Essayer de charger les logs pour récupérer l'historique et le LR
-            logs_path = f"{base_path}/GT_Contrast/training_logs.json"
+            logs_path = f"{OUTPUT_DIR}/training_logs.json"
             if os.path.exists(logs_path):
                 with open(logs_path, 'r') as f:
                     old_logs = json.load(f)
@@ -521,6 +678,23 @@ def main():
         print(f"\n📈 Entraînement: epochs {start_epoch + 1} à {total_epochs}")
     
     for ep in range(start_epoch, total_epochs):
+        # Curriculum Learning: Passer au Hard Negative Mining à l'epoch spécifiée
+        if args.hard_negatives and args.curriculum_epoch > 0 and ep == args.curriculum_epoch:
+            print(f"\n🎓 CURRICULUM SWITCH: Activation du Hard Negative Mining à l'epoch {ep + 1}")
+            print("🎯 Création du Hard Negative Sampler...\n")
+            hard_sampler = HardNegativeSampler(
+                train_emb,
+                batch_size=args.batch_size,
+                hard_ratio=args.hard_ratio,
+                hardness_k=args.hardness_k
+            )
+            train_dl = DataLoader(
+                train_ds,
+                batch_sampler=hard_sampler,
+                collate_fn=collate_fn
+            )
+            print(f"✅ DataLoader mis à jour avec Hard Negative Mining\n")
+        
         train_loss = train_epoch(model, train_dl, optimizer, DEVICE, args.temp)
         
         # Récupérer le learning rate actuel
