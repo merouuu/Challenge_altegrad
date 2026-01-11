@@ -32,29 +32,52 @@ from data_utils import (
 # =========================================================
 # TEXT LOADING
 # =========================================================
-def load_id2text(csv_path, id_col="id", text_col="description"):
+def load_id2text(graph_path, id_col="id", text_col="description"):
     """
-    Charge un dictionnaire ID -> texte depuis un CSV.
+    Extracts text descriptions from pickled graph objects.
+    Loads graphs from pickle file and extracts description attributes.
+    
+    Args:
+        graph_path: Path to .pkl file with graph objects
+        id_col: Attribute name for graph ID (usually "id")
+        text_col: Attribute name for description (usually "description")
+    
+    Returns:
+        Dict[str, str]: {graph_id: description_text}
     """
-    if not os.path.exists(csv_path):
-        print(f"⚠️  Fichier {csv_path} non trouvé, textes non disponibles")
+    if not os.path.exists(graph_path):
+        print(f"⚠️  Graph file {graph_path} not found, text descriptions unavailable")
         return {}
     
     try:
-        df = pd.read_csv(csv_path)
-        # Chercher les colonnes (cas-insensitif)
-        cols = {c.lower(): c for c in df.columns}
-        id_col_actual = cols.get(id_col.lower(), id_col)
-        text_col_actual = cols.get(text_col.lower(), text_col)
+        # Load pickle file in binary mode (graphs are binary objects)
+        with open(graph_path, 'rb') as f:
+            graphs = pickle.load(f)
         
-        if id_col_actual not in df.columns or text_col_actual not in df.columns:
-            print(f"⚠️  Colonnes {id_col}/{text_col} non trouvées dans {csv_path}")
-            print(f"   Colonnes disponibles: {list(df.columns)}")
-            return {}
+        text_dict = {}
+        missing_desc = 0
         
-        return dict(zip(df[id_col_actual].astype(str), df[text_col_actual].astype(str)))
+        for graph in graphs:
+            # Get graph ID
+            graph_id = str(getattr(graph, id_col, None))
+            if graph_id is None:
+                continue
+            
+            # Get description text
+            description = getattr(graph, text_col, "")
+            if not description:
+                missing_desc += 1
+            
+            text_dict[graph_id] = str(description) if description else ""
+        
+        if missing_desc > 0:
+            print(f"⚠️  {missing_desc}/{len(graphs)} graphs missing descriptions in {graph_path}")
+        
+        print(f"✅ Loaded {len(text_dict)} descriptions from {graph_path}")
+        return text_dict
+        
     except Exception as e:
-        print(f"❌ Erreur lors du chargement de {csv_path}: {e}")
+        print(f"❌ Error loading descriptions from {graph_path}: {e}")
         return {}
 
 # =========================================================
