@@ -84,7 +84,8 @@ class HardNegativeSampler(Sampler):
         # Convertir les embeddings en tensor (en préservant l'ordre des IDs)
         self.ids = sorted(text_embeddings_dict.keys())
         embs_list = [text_embeddings_dict[id_] for id_ in self.ids]
-        embs = torch.tensor(embs_list, dtype=torch.float32)
+        # Conversion optimisée numpy -> tensor pour éviter les erreurs de conversion
+        embs = torch.from_numpy(np.array(embs_list, dtype=np.float32))
         
         self.num_samples = len(embs)
         self.num_batches = self.num_samples // batch_size
